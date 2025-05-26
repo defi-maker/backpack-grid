@@ -34,21 +34,22 @@ SHORT_BOLL_PERIOD = 21  # 短周期布林带K线数量
 SHORT_BOLL_STD = 2.0  # 短周期标准差倍数
 
 # 仓位控制
-MAX_POSITION_SCALE = 10.0  # 最大仓位倍数，参考BBGO配置
-MIN_POSITION_SCALE = 1.0  # 最小仓位倍数
-MIN_PROFIT_SPREAD = 0.001  # 最小获利价差(0.1%)，参考BBGO配置
+MAX_POSITION_SCALE = 3.0  # 降低最大仓位倍数，从10.0降到3.0，减少激进买入
+MIN_POSITION_SCALE = 0.5  # 降低最小仓位倍数，从1.0降到0.5，减少基础买入量
+MIN_PROFIT_SPREAD = 0.0015  # 提高最小获利价差，从0.001提高到0.0015，让卖出更容易盈利
 TRADE_IN_BAND = True  # 是否只在布林带内交易
 BUY_BELOW_SMA = True  # 是否只在均线下方买入
+SELL_ABOVE_SMA = True  # 新增：是否只在均线上方卖出，增加卖出条件
 
 # 动态价差配置
 DYNAMIC_SPREAD = True  # 是否启用动态价差
-SPREAD_MIN = 0.001  # 最小价差 0.1%
-SPREAD_MAX = 0.002  # 最大价差 0.2%
+SPREAD_MIN = 0.0015  # 提高最小价差，从0.001提高到0.0015
+SPREAD_MAX = 0.003  # 提高最大价差，从0.002提高到0.003
 
-# 趋势偏移配置
+# 趋势偏移配置 - 调整为更倾向卖出
 TREND_SKEW = True  # 是否启用趋势偏移
-UPTREND_SKEW = 0.8  # 上涨趋势时的偏移系数
-DOWNTREND_SKEW = 1.2  # 下跌趋势时的偏移系数
+UPTREND_SKEW = 0.6  # 上涨趋势时的偏移系数，从0.8降到0.6，更激进卖出
+DOWNTREND_SKEW = 1.4  # 下跌趋势时的偏移系数，从1.2提高到1.4，更保守买入
 
 # 风控参数
 STOP_LOSS_ACTIVATION = 0.02  # 止损触发比例 2%
@@ -61,3 +62,8 @@ SECRET_KEY = os.getenv("BACKPACK_SECRET_KEY", "")
 
 if not API_KEY or not SECRET_KEY:
     raise ValueError("请设置环境变量 BACKPACK_API_KEY 和 BACKPACK_SECRET_KEY")
+
+# 新增：仓位控制参数
+POSITION_BIAS = -0.3  # 仓位偏移，负值表示倾向于减少持仓（多卖少买）
+MAX_POSITION_RATIO = 0.3  # 最大持仓比例，相对于总资金的30%
+SELL_BIAS_MULTIPLIER = 1.5  # 卖单大小倍数，让卖单比买单大50%

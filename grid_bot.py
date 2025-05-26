@@ -44,7 +44,11 @@ from config import (
     DOWNTREND_SKEW,
     STOP_LOSS_ACTIVATION,
     STOP_LOSS_RATIO,
-    TAKE_PROFIT_RATIO
+    TAKE_PROFIT_RATIO,
+    SELL_ABOVE_SMA,
+    POSITION_BIAS,
+    MAX_POSITION_RATIO,
+    SELL_BIAS_MULTIPLIER
 )
 from utils.indicators import BollingerBands
 from utils.database import PositionDB
@@ -475,7 +479,7 @@ class BollMakerBot:
             buy_price = round(current_price * (1 - bid_spread), self.config["PRICE_PRECISION"])
             sell_price = round(current_price * (1 + ask_spread), self.config["PRICE_PRECISION"])
             
-            # 检查是否满足交易条件
+            # 检查是否满足交易条件 - 增加更严格的买入条件和更宽松的卖出条件
             can_buy = True
             can_sell = True
             
@@ -483,22 +487,71 @@ class BollMakerBot:
                 can_buy = self.short_boll.is_price_in_band(current_price, short_upper, short_lower)
                 can_sell = self.short_boll.is_price_in_band(current_price, short_upper, short_lower)
                 
+            # 更严格的买入条件
             if self.config["BUY_BELOW_SMA"]:
                 can_buy = can_buy and current_price < short_middle
                 
-            # 检查最小利润
+            # 新增：更宽松的卖出条件
+            if self.config.get("SELL_ABOVE_SMA", False):
+                # 只要价格不是明显低于均线就可以卖出
+                can_sell = can_sell and current_price >= short_middle * 0.995  # 允许稍微低于均线0.5%
+                
+            # 检查最小利润 - 降低卖出门槛
             if position_cost > 0:
                 min_sell_price = round(position_cost * (1 + self.config["MIN_PROFIT_SPREAD"]), self.config["PRICE_PRECISION"])
                 can_sell = can_sell and sell_price > min_sell_price
+            else:
+                # 没有持仓成本时，更容易卖出
+                can_sell = True
                 
-            # 计算订单数量
+            # 获取当前持仓信息，用于仓位控制
+            current_position = self._get_cached_position()
+            current_position_size = current_position.get("size", 0) if current_position else 0
+            
+            # 计算当前持仓价值占总资金的比例
+            if current_position_size > 0 and current_price > 0:
+                position_value = current_position_size * current_price
+                position_ratio = position_value / self.config["GRID_TOTAL_INVESTMENT"]
+                
+                # 如果持仓比例超过最大限制，停止买入，强制卖出
+                if position_ratio > self.config.get("MAX_POSITION_RATIO", 0.3):
+                    can_buy = False
+                    can_sell = True  # 强制允许卖出
+                    logger.warning(f"持仓比例过高 {position_ratio:.2%}，停止买入，优先卖出")
+            
+            # 额外的保守买入条件：只在价格明显偏低时才买入
+            if can_buy:
+                # 只有当价格低于短期布林带中轨一定幅度时才买入
+                buy_threshold = short_middle * 0.99  # 低于均线1%才买入
+                can_buy = can_buy and current_price < buy_threshold
+                
+            # 计算订单数量 - 修改为卖单优先策略
             base_order_size = self.config["BASE_ORDER_SIZE"]
             quote_order_size = self.config["QUOTE_ORDER_SIZE"]
             
-            # 根据持仓比例调整订单大小，添加最大订单限制
-            max_order_size = base_order_size * 5  # 最大订单限制为基础订单的5倍
-            buy_size = min(max(base_order_size * position_scale, base_order_size), max_order_size)
-            sell_size = min(max(base_order_size * (1 + (1 - position_scale)), base_order_size), max_order_size)
+            # 降低最大订单限制，控制风险
+            max_order_size = base_order_size * 3  # 从5倍降到3倍
+            
+            # 重新设计订单大小计算逻辑
+            # 买单：更保守，基础大小 * 较小的比例
+            buy_scale = min(position_scale * 0.7, 1.0)  # 最多70%的比例用于买单
+            buy_size = min(max(base_order_size * buy_scale, base_order_size * 0.5), max_order_size)
+            
+            # 卖单：更激进，基础大小 * 更大的比例
+            sell_scale = max(1.0, (2.0 - position_scale) * self.config.get("SELL_BIAS_MULTIPLIER", 1.5))
+            sell_size = min(max(base_order_size * sell_scale, base_order_size), max_order_size)
+            
+            # 如果持仓过多，进一步增加卖单大小，减少买单大小
+            if current_position_size > 0:
+                position_value = current_position_size * current_price
+                position_ratio = position_value / self.config["GRID_TOTAL_INVESTMENT"]
+                
+                if position_ratio > 0.2:  # 持仓超过20%时
+                    # 减少买单大小
+                    buy_size = buy_size * (1 - position_ratio)
+                    # 增加卖单大小
+                    sell_size = sell_size * (1 + position_ratio * 0.5)
+                    sell_size = min(sell_size, max_order_size)
             
             # 格式化数量到指定精度（确保不超过3位小数）
             precision = self.config["QUANTITY_PRECISION"]
@@ -554,12 +607,12 @@ class BollMakerBot:
     def _calculate_position_scale(self, current_price: float,
                                 long_upper: float, long_lower: float,
                                 short_upper: float, short_lower: float) -> float:
-        """计算目标持仓比例"""
+        """计算目标持仓比例 - 修改为更保守的买入策略"""
         try:
             # 不需要加锁，因为使用的是数据副本
             if not all([long_upper, long_lower, short_upper, short_lower]):
-                logger.warning("布林带数据未完全初始化，返回中性仓位")
-                return 1.0
+                logger.warning("布林带数据未完全初始化，返回保守仓位")
+                return self.config["MIN_POSITION_SCALE"]
 
             # 检查分母是否为零或接近零
             long_range = long_upper - long_lower
@@ -568,8 +621,8 @@ class BollMakerBot:
             min_range = 0.0001  # 定义最小有效范围
             
             if long_range <= min_range or short_range <= min_range:
-                logger.warning("布林带范围过小，返回中性仓位")
-                return 1.0
+                logger.warning("布林带范围过小，返回保守仓位")
+                return self.config["MIN_POSITION_SCALE"]
             
             # 计算价格在长期和短期布林带中的位置
             long_position = (current_price - long_lower) / long_range
@@ -579,12 +632,17 @@ class BollMakerBot:
             long_position = max(0.0, min(1.0, long_position))
             short_position = max(0.0, min(1.0, short_position))
             
-            # 反转位置值（价格越低，仓位越大）
-            long_position = 1.0 - long_position
-            short_position = 1.0 - short_position
+            # 修改：减少反转程度，让仓位变化更平缓
+            # 原来是完全反转(1.0 - position)，现在只部分反转
+            long_position = 0.8 - 0.6 * long_position  # 从[0,1]映射到[0.8,0.2]
+            short_position = 0.8 - 0.6 * short_position
             
             # 综合长期和短期指标
             position_scale = (long_position + short_position) / 2
+            
+            # 应用仓位偏移（负值表示倾向于减少持仓）
+            position_scale = position_scale + self.config["POSITION_BIAS"]
+            position_scale = max(0.1, min(1.0, position_scale))  # 限制在合理范围
             
             # 应用配置的仓位范围
             min_scale = self.config["MIN_POSITION_SCALE"]
@@ -594,13 +652,13 @@ class BollMakerBot:
             position_scale = min_scale + (max_scale - min_scale) * position_scale
             
             logger.debug(f"计算仓位比例 - 当前价格: {current_price}, 长期位置: {long_position:.4f}, " +
-                      f"短期位置: {short_position:.4f}, 最终比例: {position_scale:.4f}")
+                      f"短期位置: {short_position:.4f}, 偏移后: {position_scale:.4f}")
             
             return position_scale
                 
         except Exception as e:
             logger.error(f"计算持仓比例失败: {str(e)}")
-            return 1.0  # 发生错误时返回中性仓位
+            return self.config["MIN_POSITION_SCALE"]  # 发生错误时返回最小仓位
             
     def subscribe_order_updates(self):
         """订阅订单更新流"""
@@ -1066,7 +1124,7 @@ if __name__ == "__main__":
         "GRID_TOTAL_INVESTMENT": GRID_TOTAL_INVESTMENT,
         "PRICE_PRECISION": PRICE_PRECISION,
         "QUANTITY_PRECISION": QUANTITY_PRECISION,
-        "GRID_SPREAD": SPREAD,
+        "SPREAD": SPREAD,
         "LONG_BOLL_PERIOD": LONG_BOLL_PERIOD,
         "LONG_BOLL_STD": LONG_BOLL_STD,
         "SHORT_BOLL_PERIOD": SHORT_BOLL_PERIOD,
@@ -1076,6 +1134,7 @@ if __name__ == "__main__":
         "MIN_PROFIT_SPREAD": MIN_PROFIT_SPREAD,
         "TRADE_IN_BAND": TRADE_IN_BAND,
         "BUY_BELOW_SMA": BUY_BELOW_SMA,
+        "SELL_ABOVE_SMA": SELL_ABOVE_SMA,
         "BASE_ORDER_SIZE": BASE_ORDER_SIZE,
         "QUOTE_ORDER_SIZE": QUOTE_ORDER_SIZE,
         "LONG_BOLL_INTERVAL": LONG_BOLL_INTERVAL,
@@ -1088,7 +1147,10 @@ if __name__ == "__main__":
         "DOWNTREND_SKEW": DOWNTREND_SKEW,
         "STOP_LOSS_ACTIVATION": STOP_LOSS_ACTIVATION,
         "STOP_LOSS_RATIO": STOP_LOSS_RATIO,
-        "TAKE_PROFIT_RATIO": TAKE_PROFIT_RATIO
+        "TAKE_PROFIT_RATIO": TAKE_PROFIT_RATIO,
+        "POSITION_BIAS": POSITION_BIAS,
+        "MAX_POSITION_RATIO": MAX_POSITION_RATIO,
+        "SELL_BIAS_MULTIPLIER": SELL_BIAS_MULTIPLIER
     }
     
     bot = None
